@@ -1,0 +1,3 @@
+/home/root/
+/bin/scanview_serverd:progs
+/bin/scanview_server:progs

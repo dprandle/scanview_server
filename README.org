@@ -1,0 +1,756 @@
+* Edison Control Module
+
+The edison control module is a program that runs on the edison and integrates the rplidar scanner, pulsed light lasers, and LSM9DS0 together to create a navigation control scheme. Eventually this system will be capable of full SLAM but for now the focus is obstacle avoidance. All data is sent to any listening sockets over an available wifi network.
+
+Software is also being developed for opening a socket with the edison and visualizing the received data. The software is called "scanview" and is available for source download at https://github.com/dprandle/scanview.
+
+Though the software is set up for this particular application, it is written in such a way that allows for many other applications as well. This document will give an overview of the main software framework features. Before going in to the software, the hardware neccessary is shown.
+
+** Harware Hookup Guide
+
+A list of required components is given below.
+
+#+CAPTION: Parts necessary for edison control system
+#+NAME:   fig:HOOKUP
+| Part            | Price    | Qty | Website                                                    |
+|-----------------+----------+-----+------------------------------------------------------------|
+| Intel Edison    | $49.95   |   1 | https://www.adafruit.com/products/2112                     |
+| I2C Block       | $14.95   |   1 | https://www.sparkfun.com/products/13034                    |
+| UART Block      | $24.95   |   1 | https://www.sparkfun.com/products/13040                    |
+| 9DOF IMU Block  | $34.95   |   1 | https://www.sparkfun.com/products/13033                    |
+| GPIO Block      | $14.95   |   1 | https://www.sparkfun.com/products/13038                    |
+| RPLidar Scanner | $398.90  |   1 | http://www.robotshop.com/en/rplidar-360-laser-scanner.html |
+| LIDAR Light     | $114.95  |   2 | https://www.sparkfun.com/products/13680                    |
+|-----------------+----------+-----+------------------------------------------------------------|
+| TOTAL           | $768.55  |
+
+#+TBLFM: $2={49.95+14.95+24.95+34.95+14.95+398.90+2*114.95}
+
+With these components, the system can be setup according to the following hookup diagram:
+
+#+CAPTION: Pin diagram for edison, stacks, range finders, and lidar
+#+NAME:   fig:HOOKUP
+[[file:./doc/hookup/schemeit-project.png]]
+
+Keep in mind that the edison needs to have Yocto linux flashed to it before ctrlmod will work at all. Its also a good idea to update the mraa library to the latest version hosted on github. The instructions of how to do this are available on the github page.
+https://github.com/intel-iot-devkit/mraa
+
+This may not be necessary though - the only thing currently that uses mraa is the gpio pins connected to the range finders. I beleive that the stock version of mraa included with the latest Yocto distro will work just fine for this.
+
+** Software Documentation
+
+Following, some of the most important software features are described. Documentation is currently being developed for the code itself, and when finished will be available under the doc folder. The file "annotated.html" is the entry point for the html documentation, and the file "annotated.tex" is the entry point for the latex documentation. Also, a hyperlinked pdf file should be made available soon.
+
+*** Overview
+
+A software flow chart for the edison control module is shown below.
+
+#+CAPTION: Basic flow diagram for software
+#+NAME:   fig:SOFTWARE_BLOCK
+[[file:./doc/software_block.png]]
+
+The edison software is dependent on systems to do work. Each system has an init function, release function, process function, and update function which are called according to the above block diagram (process not shown but it is called immediately following update for each system). See the System section for more details about how to implement a custom system.
+
+The systems currently developed for the edison control module are listed below.
+
+**** edrplidar_system
+
+This system reads in data from the rplidar scanner and creates a scan message whenever a complete scan has been received. This scan message has the raw scan data which can be used by any interested system (such as the navigation system) to do work. This system also responds to all rplidar commands and creates message responses for those commands requiring a response. For example, a firware message is created in response to the rplidar_reset_request message. The firware message contains an ascii string with firware information.
+
+**** edpl_system
+
+This system reads in both laser range finders and creates a message every 100 ms with the averaged distance for each sensor. The average is taken every 100 ms - the same rate as which messages are created. This interval can be changed by changing the value of msgTimer->set_callback_delay(100) in edrpl_system::init to whatever interval (in milliseconds) is neccessary. The message with both laser range finder's distances will be generated in that same interval. The laser range finder pointed at the ceiling is GPIO_14 while the range finder pointed at the floor is GPIO_15.
+
+**** edlogging_system
+
+This system is set up to log significant messages to file. Currently it logs all of the rplidar response messages (ie the device firware, health, and info messages). It is setup to log scans and navigation messages but currently these are both disabled as testing was being done with these messages and I wanted to make sure that logging them to file wasn't messing anything up. The scan message's "toString" method can be used to log the scan message (ie log_message(scanmsg->toString())).
+
+**** edimu_system
+
+The 9dof sensor communicates with the edison over i2c - and supplies 3 dimensional accelerometer, gyrometer, and magnometer readings. Currently this system is unfinished because it depends on i2c which is still being worked on. The line edm.add_sys<edimu_system>() is commented out for this reason. Once complete, this system should generate imu messages with these 9 values. These values could then be used by all of the other systems.
+
+**** ednav_system
+
+This system responds to pulsed light messages, scan messages, and eventually imu messages in order to issue command messages to the attached board. The attached board currently is the arduino mega, and i2c is used with the arduino mega being the slave and the edison being the master: The arduino is given an address of 0x04. The message sent to the arduino contains 4 16 bit values which are pitch, roll, yaw, and throttle respectively. The format is shown below.
+
+| Variable | Type              | Range       |
+|----------+-------------------+-------------|
+| Pitch    | 16 bit signed int | -500 to 500 |
+| Roll     | 16 bit signed int | -500 to 500 |
+| Yaw      | 16 bit signed int | -500 to 500 |
+| Throttle | 16 bit signed int | -500 to 500 |
+
+The throttle is determined by taking the difference between the ceiling and floor distances and inputting this value as an error in to the altitude PID.
+
+The pitch and roll values are determined by summing all scan vectors in a gravitational force fashion. That is, each unit vector from the origin (scanner location is considered origin) to the scan point is multiplied by a g constant and divided by the distance squared before being summed with the next scan point vector. The resultant vector is considered to be the error value which is input in to the PID because the goal is to have no resultant vector (equally far away from everything).
+
+The G constant is given by the class variable m_G_mult, and can be set using the scanview Qt application.
+
+The Yaw value is determined by looking at the angle between this frame and last frame resultant vectors. Yaw is set so that it would decrease this angle - we want the UAV to try and face the direction in which it should travel. This should be improved once IMU data is available. Rather than taking the angle between this frame's and last frame's resultant vectors, it should take the difference between this frame's resultant and the IMU gyro data.
+
+This data packet is generated and sent to the arduino once every 50 ms. This value can be changed in the ednav_system::init function (the line "m_nav_timer->set_callback_delay(50)").
+
+In addition to sending out this data packet to the arduino over i2c in response to scan and pulsed light messages, this system also responds to the "nav_system_request" message. This message contains desired values for all PID values, the bias_vector, and the bias threshold distance.
+
+The bias vector is a vector that is added to each scan - the idea is to add a goal direction. For instance, if there is nothing very close by then the resultant vector will be very small due to the r^2 relationship - this bias vector would then determine the direction of travel.
+
+The threshold distance is a useful parameter to allow the edison to react to things nearby without influence from the bias vector. That is, if there is any point within the threshold distance the bias vector will not be added to the scan.
+
+If threshold dropout is enabled then non zero navigation commands will only be issued if there is a scan point within the threshold distance. In essence, navigation is disabled completely unless something gets close (within the threshold distance) and then it will kick in, allowing the control module to act as virtual bumper gaurds.
+
+The navigation PID is essentially 4 PIDs combined in to one. A four element vector is used as the PID value type - x component is the pitch, y component is the roll, z component is the yaw, and w component is the throttle.
+
+**** edcomm_system
+
+This system is completely responsible for all socket communication. It takes any messages that may be of interest to observers and transmits them to all connected clients. On startup the comm system creates a server. The port for this server is specified on the command line when starting ctrlmod - for example to start the server on port 3366:
+
+#+BEGIN_SRC python
+~ $ ./ctrlmod -port:3366
+#+END_SRC
+
+If no port is specified then port 2345 is used. Any number of clients can connect to the edison. The client can send rplidar commands to control the scanner and it can send navigation commands to customize the navigation system. The following structure is used to send a command.
+
+#+BEGIN_SRC c++
+struct Command
+{
+    Command();
+
+    union
+    {
+        struct
+        {
+            uint32_t hash_id;
+            uint32_t cmd_data;
+			double cmd_data_d;
+			double cmd_data_d2;
+			double cmd_data_d3;
+			double cmd_data_d4;
+			double cmd_data_d5;
+			double cmd_data_d6;
+			double cmd_data_d7;
+			double cmd_data_d8;
+        };
+        uint8_t data[COMMAND_BYTE_SIZE];
+    };
+};
+#+END_SRC
+
+The hash_id determines the message type and should be filled out by taking the hash of the command name. For example, the following code shows how to send a navigation command - it is used in scanview with Qt socket.
+
+#+BEGIN_SRC c++
+    command_t com_to_send;
+    command_type cmd = static_cast<command_type>(m_ui->m_command_cbox->currentIndex());
+    com_to_send.hash_id = _hash_id("rplidar_request");
+    com_to_send.cmd_data = cmd;
+    m_sckt->write((char*)com_to_send.data, COMMAND_BYTE_SIZE);
+#+END_SRC
+
+The static cast here simply casts a combo box index in to a command type. A command type determines which rplidar command - for example 0 is health request and 5 is reset. See rplidar_request message for the exact enum values. COMMAND_BYTE_SIZE is the size in bytes of the command structure - which is 72. If the structure is extended make sure to extend this value also.
+
+If you want to hash strings that match correctly you can either use the hash_id function in edutility, or you will need to copy paste this function to create the same hash id in other programs that may be communicating with the edison through sockets. I would also suggest just copy pasting the Command structure.
+
+The double data fields can be used to store anything of interest. It is kind of an obtuse and inflexible way to do it but for now that was the quickest way to set it up.
+
+The comm system sends the following messages:
+- rplidar_scan_message
+- rplidar_health_message
+- rplidar_info_message
+- rplidar_error_message
+- rplidar_firmware_message
+- pulsed_light_message
+- nav_message
+
+All of these messages are send exactly as the message structure except for the scan message. The scan message is sent as an array of unsigned 32 bit integers that is twice as large as the number of scan points taken. The first unsigned int is the angle multiplied by 64, and the second unsigned int is the distance multiplied by four. The size of the array is sent right before the vector itself.
+
+For all outgoing messages, the hashed id (which is an 32 bit unsigned integer) is sent before the message itself. This allows the message type to be identified before decoding the message. For the scan message, the first value sent is the 32 bit hashed id, then the 32 bit size of the scan array, and then the array itself.
+
+*** Main Control
+
+The main edison control point is a class called edmctrl - this stands for edison main control. To access the functions of this class the following macro is defined.
+  
+#+BEGIN_SRC c++
+#define edm edmctrl::inst()
+#+END_SRC
+
+All of the functions in edmctrl are callable through "edm". For example, to get the system timer:
+
+#+BEGIN_SRC c++
+edtimer * systimer = edm.sys_timer();
+#+END_SRC
+
+The edmctrl public interface is shown below.
+
+#+BEGIN_SRC c++
+class edmctrl
+{
+  public:
+
+    edmctrl();
+    virtual ~edmctrl();
+    
+    template<class T>
+    T * add_sys();
+
+    static edmctrl & inst();
+
+    bool running();
+
+    virtual void init();
+	
+    virtual void release();
+
+    edmessage_dispatch * message_dispatch();
+
+    void start();
+
+    void stop();
+
+    edtimer * sys_timer();
+
+    virtual void update();
+    
+    template<class T>
+    void rm_sys();
+
+    void rm_sys(const std::string & sysname);
+
+    template<class T>
+    T * sys();
+
+    edsystem * sys(const std::string & sysname);
+
+    static void quit(void);
+};
+#+END_SRC
+
+The main logic comes in the form of systems. The details of systems will be discussed later, but just observe that systems are added and removed through the edmctrl interface. The message dispatcher and system timer are available through this interface as well.
+
+To add a system to the edison control module simply call add_sys with the system type as the template arguement. Systems are removed in the same way.
+
+The start() function should be called at the beginning of the main entry point, and then a loop checking the running() function which calls update every frame should be established. The stop function should be called at the end of the program. The start() function starts the sys_timer and then calls init(), while the stop function stops the sys_timer and calls release(). It is possible to create a subclass of edmctrl and override the init(), release(), and update() functions to do something different.
+
+The static quit function allows the user to give a callback function for system exit calls. It does nothing other than call stop() on the global static edmctrl instance.
+
+An example of a main entry point with several custom system types added is shown below.
+
+#+BEGIN_SRC c++
+#include <edmctrl.h>
+#include <edrplidar_system.h>
+#include <edplsystem.h>
+#include <ednavsystem.h>
+#include <edlogging_system.h>
+#include <edcomm_system.h>
+#include <edimu_system.h>
+
+int main(int argc, char * argv[])
+{
+    edm.add_sys<edrplidar_system>();
+    edm.add_sys<edpl_system>();
+    edm.add_sys<ednav_system>();
+    edm.add_sys<edlogging_system>();
+    edm.add_sys<edcomm_system>();
+    edm.add_sys<edimu_system>();
+	
+    edm.start();
+    while (edm.running())
+		edm.update();
+    edm.stop();
+    return 0;
+}
+#+END_SRC
+
+*** Systems
+
+The main unit of interest in the control module is called the "system". The control module consists of several systems which each update and do work every frame. The base class for a system is shown below.
+
+#+BEGIN_SRC c++
+class edsystem
+{
+  public:
+
+    edsystem() {}
+
+    virtual ~edsystem() {}
+
+    virtual void init() = 0;
+
+    virtual void release() = 0;
+
+    virtual bool process(edmessage * msg)=0;
+
+    virtual void update() = 0;
+
+    virtual std::string typestr() = 0;
+};
+#+END_SRC
+
+The functions shown above each serve a purpose.
+
+**** init()
+
+At startup, the module goes through each registered system and calls the init function. This function can be thought of as the "setup" function for those are are used to arduino environment.
+
+As an aside note - this is also where you would register interest in certain messages that the system wants to receive. This will be talked about more in the message handler discussion, but just as an example: If the system was interested in a message of type "complete_scan_message", the following would be added to the init() function.
+
+#+BEGIN_SRC c++
+edm->message_dispatch()->register_listener<complete_scan_message>(this);
+#+END_SRC
+
+Now, any messages of type "complete_scan_message" would be sent to this system for processing (via the "process" function).
+
+**** update()
+
+Every frame the update function is called. This would be equivalent to the arduino "loop" function. It is usually a good idea to avoid blocking calls here as it may mess up other systems.
+   
+**** release()
+
+When using a microprocessor with an operating system, it is necessary to release some types of resources before shutdown. Also, if a system is to be added/removed dynamically (for example sensor hotswap), then there needs to be a function that is called when the system is removed to free the resources.
+
+In this function you would free all resources allocated with init. The most important example - if you created separate threads to do work then these should be stopped here. The operating system will kill threads automatically on program shutdown except for the case when main is exited with pthread_exit(). In that case the threads will continue running until they reach their stop point (could be never) or until edison shuts down.
+
+**** process(edmessage * msg)
+
+Each system receives messages that they have registered interest in here. The type "edmessage" is a struct which can be subclassed to create a custom message type. To get to the message type of interest, it is neccessary to cast the pointer. You can do this with dynamic cast and it is not neccessary to check the type string (more on type string later), or you can use the type string to know which message type has arravied and cast accordingly. For example - if "complete_scan_message" is a message of interest, the following could be used.
+
+***** Using dynamic cast
+
+#+BEGIN_SRC c++
+complete_scan_message * casted_msg = dynamic_cast<complete_scan_message*>(msg);
+if (casted_msg != NULL)
+{
+    // this means the message was of type "complete_scan_message"
+    // we can now use data contained in casted_msg and do useful stuff
+}
+#+END_SRC
+
+***** Using type string and static cast
+
+#+BEGIN_SRC c++
+if (msg->type() == "complete_scan_message")
+{
+    complete_scan_message * casted_msg = static_cast<complete_scan_message*>(msg);
+    // We can use static cast because we know the type has to be correct as the type string matches
+}
+#+END_SRC
+
+Dynamic casts require some overhead (where as static casts require none) but then again, no string comparison is necessary using the dynamic cast method.
+
+This function should almost always return true - if false is returned the message is not removed from the system's message buffer. This can be used to an advantage - for example if there is some condition that must be satisfied before a message can be handled, false can be returned when handling the message until that condition is met, and then true can be returned and the message will be removed from the buffer. No other messages will be processed during this time however.
+
+**** typestr()
+
+Any time a new system is created it must return a typestring to identify the system - preferably a string that is the exact same as the system name. A static function must be created with the name TypeString() to return the string also. The best way to do it is to make TypeString() return the string, and then typestr() should just call TypeString(). The edmctrl object uses this string to store and retreive systems.
+
+Messages also need to implement a type string function. The message function is called type() and the static function is Type() - this is an unfortunate difference that could possibly be fixed later, but for now this is the way it is.
+
+Any example of a complete system subclass declaration is shown. This system receives various messages and logs them to file.
+
+#+BEGIN_SRC c++
+class edlogging_system : public edsystem
+{
+  public:
+    edlogging_system() {}
+    virtual ~edlogging_system() {}
+
+    virtual void init();
+    virtual void release();
+    virtual bool process(edmessage * msg);
+    virtual void update();
+	
+    virtual std::string typestr() {return TypeString();}
+    static std::string TypeString() {return "edlogging_system";}
+	
+  private:
+
+    void log_device_info(info_data_packet * data);
+    void log_device_health(health_data_packet * data);
+    void log_device_firware(firmware_data_packet * data);
+    void log_scan(complete_scan_data_packet * scand);	
+};
+#+END_SRC
+
+*** Messages
+
+The messaging implementation involves custom message types which are dispatched to systems of interest.
+
+**** Message dispatch
+
+The message dispatch object allows systems to register interest in messages and allows messages to be pushed to all interested systems. If a certain message has no registered interested systems then a NULL pointer will be returned on pushing the message.
+
+Each system has its own FIFO buffer - messages will be delivered to systems in the order they are pushed. A message will stay in a system's buffer until the system returns true when the message is passed to the system's process function (as previously mentioned). It is possible to push a message to the front of any interested system's buffer however by using push_front instead of push. This may be useful in the case where a message should be of utmost importance (such as a reset command for a sensor for example).
+
+The class definition is the following.
+
+#+BEGIN_SRC c++
+class edmessage_dispatch
+{
+public:	
+    
+    typedef std::map< std::string, std::set<edsystem*> > listener_map;
+    typedef std::map<edsystem*, std::deque<edmessage*> > listener_queue;
+	
+    edmessage_dispatch();
+    virtual ~edmessage_dispatch();
+
+    template<class MessageType>
+    void register_listener(edsystem * sys);
+
+    template<class MessageType>
+    void unregister_listener(edsystem * sys);
+
+    template<class MessageType>
+    MessageType * push();
+
+    template<class MessageType>
+    MessageType * push_front();
+
+    edmessage * next(edsystem * sy    s);
+
+    void pop(edsystem * sys);
+
+    void pop_back(edsystem * sys);
+
+    void process_all(edsystem * sys);
+	
+private:
+	listener_map m_listeners;
+	listener_queue m_lmessages;
+};
+#+END_SRC
+
+The register_listener and unregister_listener functions allow systems to register interest in message types. Their use is the following:
+
+#+BEGIN_SRC c++
+
+// get custom system
+custom_system_type * custom_system_pointer = edm.sys<custom_system_type>();
+
+// to register interest in custom_message_type
+edm.message_dispatch()->register_listener<custom_message_type>(custom_system_pointer);
+
+// and now unregister interest (will also remove any unprocessed messages)
+edm.message_dispatch()->unregister_listener<custom_message_type>(custom_system_pointer);
+#+END_SRC
+
+These functions are usually called in whatever system's init function which means the "this" pointer can be used.
+
+#+BEGIN_SRC c++
+edm.message_dispatch()->register_listener<custom_message_type>(this);
+#+END_SRC
+
+Pushing a message has the same format except that register_listener is replaced with push or push_front. All messages are sent to systems automatically so there is no need to call process_all, pop, pop_front, or next functions usually. However, there may be specific cases where this could be useful so they are left as public functions. That is, it is possible to explicitly get a system's next message by calling next(system_pointer), and it is possible to remove the next message with pop (or remove the last message in the buffer with pop_back).
+
+One thing to realize is that "push" pushes messages to the back of the buffer, and "pop" pops messages from the front of the buffer (ie the next message). Accordingly, "push_front" pushes messages to the front of the buffer and "pop_back" pops messages from the back of the buffer.
+
+The function process_all will immediately call process on a system for all messages in the system's message buffer (unless the system returns false in its process function - then processing messages will end there).
+
+**** Custom Messages
+
+It is possible to create any custom type of message by subclassing the edmessage structure. The class declaration is shown below.
+
+#+BEGIN_SRC c++
+struct edmessage
+{
+    virtual ~edmessage() {}
+    virtual std::string type()=0;
+
+    uint32_t ref_count;
+};
+#+END_SRC
+
+The only function that must be implemented is type, and as with system a static function called Type() should also be made. An example of a custom message type is shown below.
+
+#+BEGIN_SRC c++
+struct rplidar_error_message : public edmessage
+{
+    rplidar_error_message();
+    uint8_t message[100];
+	
+    std::string type() {return Type();}
+    static std::string Type() {return "rplidar_error_message";}	
+};
+#+END_SRC
+
+This message can now be registered by interested systems and can be pushed to the message dispatcher.
+
+#+BEGIN_SRC c++
+void mysystem::init()
+{
+    // register interest
+    edm.message_dispatch()->register_listener<rplidar_error_message>(this);
+}
+
+void mysystem::process(edmessage * msg)
+{
+    rplidar_error_message * casted_msg = dynamic_cast<rplidar_error_message*>(msg);
+    if (casted_msg != NULL)
+    {
+        m_received_error = true; // set error flag
+        copy_buf(casted_msg->message, 100, m_error_message, 100); // copy error message
+    }
+}
+
+void mysystem::update()
+{
+    // m_error_message and m_received_error are class variables
+    if (m_received_error)
+    {
+        display(m_error_message); // call some display function or do something else
+        m_received_error = false; // reset flag
+    }
+}
+#+END_SRC
+
+And now, any system or any other code can push an "rplidar_error_message" and "mysystem" will receive it. Be careful to not create another message of interest in response to a message which can again push the original message as it can create an infinite message loop. The code will not crash - it would just keep pushing messages and responding to them infinitely. This seems like common sense, but with many systems there can be some gotchas. This psuedocode illusrates.
+
+In system 1
+If received message type A
+Create message type B in response
+
+If received message type B
+Create message type C in response
+
+In system 2
+If received message type C
+Create message type A in response
+
+When pushing messages that contain data fields, the message should always be checked for NULL before filling in the data. For example, pushing the rplidar_error_message:
+
+#+BEGIN_SRC c++
+rplidar_error_message * msg = edm->message_dispatch()->push<rplidar_error_message>(); // push message
+
+// now check to make sure not NULL before filling message
+if (msg != NULL)
+{
+    std::string err_msg("There was some terrible error");
+    copy_buf(err_msg.c_str(), err_msg.size(), msg->message, err_msg.size()); // fill in message
+}
+#+END_SRC
+
+It is necessary to check for NULL because if no systems have registered interest then a message will not be created and NULL will be returned.
+
+*** Timers and Callbacks
+
+It is possible to use timers and callbacks to make something happen in a certain amount of time. A callback can be made by subclassing edcallback and reimplementing the exec() function. The edtimer_callback class is used with timers - this has a member pointer to the timer allowing modifications to be made to the timer from within the callback (for example the callback can stop the timer).
+
+In order for timers to be useful with callback functions, the timer update function must be called once every frame. This calculates how much time has passed since the last frame and makes it available with the dt() function, and it also will determine if a callback should be executed.
+
+Timers can be used without calling update as well if the callback functionality is not needed. For example, if you want to measure the time it takes to execute a loop you can do the following:
+
+#+BEGIN_SRC c++
+edtimer t;
+t.start();
+for (int i = 0; i < 1000; ++i) {}
+t.stop();
+double elapsed_time = t.elapsed();
+#+END_SRC
+
+The elapsed time it took to go through this loop in milliseconds will be stored in elapsed_time.
+
+If a callback needs to be assigned to a timer, then the timer must be updated. The more frequently the timer is updated, the closer the callback will be executed to the specified timer. The timer public interface is shown below.
+
+#+BEGIN_SRC c++
+class edtimer
+{
+  public:
+	
+	enum cb_mode {
+		single_shot,
+		continous_shot
+	};
+	
+	edtimer();
+	~edtimer();
+	
+	void start();
+
+	void update();
+
+	edtimer_callback * callback();
+
+	cb_mode callback_mode();
+
+	double callback_delay();
+
+	void cont();
+
+	void stop();
+
+	void set_callback(edtimer_callback * cb);
+
+	void set_callback_mode(cb_mode mode);
+
+	void set_callback_delay(double ms);
+	
+	double dt();
+
+	bool running();
+
+	double elapsed();
+};
+#+END_SRC
+
+The callback modes specify whether a callback should be executed once or repeatedly. When using callbacks with timers like this, usually the callback would be assigned and the timer started in a system init function, and the timer would be updated in the system update function. The following shows a simple example to push an rplidar_error_message every 200 ms. An example system called custom_system will be used to illustrate the typical use with systems. Assume that "m_timer" is a class variable.
+
+#+BEGIN_SRC c++
+// This is our custom callback struct - just inherit from
+// edtimer callback and reimplement exec to do what is needed
+struct my_custom_callback : public edtimer_callback
+{
+    void exec()
+    {
+        rplidar_error_message * msg = edm->message_dispatch()->push<rplidar_error_message>(); // push message
+        if (msg != NULL)
+        {
+            std::string err_msg("There was some terrible error");
+            copy_buf(err_msg.c_str(), err_msg.size(), msg->message, err_msg.size()); // fill in message
+        }
+    }
+};
+
+// Other system functions (relase, process, etc)
+
+void custom_system::init()
+{
+    // do other system initialization/setup code
+
+    // Set the callback to the above defined struct
+    m_timer.set_callback(new my_custom_callback());
+
+    // Set the callback to be continously executed (in this case every 200 ms)
+    m_timer.set_callback_mode(edtimer::continous_shot);
+
+    // Set the delay to 200 ms
+    m_timer.set_callback_delay(200.0);
+}
+
+void custom_system::update()
+{
+    m_timer.update(); // update the timer
+    // Do all the other needed stuff for the system
+}
+#+END_SRC
+
+
+
+
+It is also possible to pause and continue timers - this will make it so that elapsed time will not reset to zero but callbacks and dt and everything else will work normally.
+
+*** Threaded File Descriptors
+
+In linux, everything is a file. This includes i2c, uart, gpio, and socket devices. To make it easier to use these devices, a threaded file descriptor class is in place. This allows the user to read and write from these devices freely without having to worry about blocking issues, or if non-blocking is set then without needing to keep a buffer to store data that needs to be written (this would be necessary because in non-blocking mode writing can fail if the device is not ready for more data).
+
+The specifics aren't really important, but a subclass is available for uart, sockets, and i2c to make use of asynchronous reading and writing.
+
+Using uart as an example, a thread is created to talk to the uart device. This thread can use blocking write calls because it does not interfere with the main thread's execution. Anytime data is read, it is stored in an internal buffer and and anytime data is available to write, it will issue a blocking write call.
+
+It is also possible to tell the uart to wait for a certain number of bytes before writing anything else. This is useful to issue a chain of commands to a uart device where each command should receive a response. 
+
+For example: lets say a device has three commands - 0x0A, 0x0B, and 0x0C. In response to 0x0A the device should reply with two bytes, in reponse to 0x0B the device should reply with 7 bytes, and in response to 0x0C the device should reply with 32 bytes (these are picked at random). To issue these commands without worrying about waiting for each response before continuing to the next command we could do the following:
+
+#+BEGIN_SRC c++
+int8_t com1 = 0x0A, com2 = 0x0B, com3 = 0x0C;
+m_uart->write(&com1, 1, 2);
+m_uart->write(&com2, 1, 7);
+m_uart->write(&com3, 1, 32);
+#+END_SRC
+
+
+Here com2 will not be sent until 2 bytes has been received after com1, and com3 wont be sent until 7 bytes has been received after com2. Then 32 bytes must be received before any other data will be sent.
+
+To send more then one byte just create an array of the bytes. For example, to send 0x04, 0x05, 0x0B, 0x0C just use..
+
+#+BEGIN_SRC c++
+int8_t buf[4];
+buf[0] = 0x04;
+buf[1] = 0x05;
+buf[2] = 0x0B;
+buf[3] = 0x0C;
+write(buf, 4);
+// or if we need a reply of say.. 5 bytes
+// write(buf, 4, 5);
+#+END_SRC
+
+Receiving data from file descriptor devices is similar to sending it.
+
+#+BEGIN_SRC c++
+// try to receive a single byte and do something with it
+int8_t byte;
+uint32_t cnt = read(&byte, 1);
+if (cnt == 1)
+    do_something(byte);
+
+// or try to receive 4 bytes and do something with them
+int8_t buf[4];
+uint32_t cnt = read(buf, 4);
+for (int32_t i = 0; i < cnt; ++i)
+    do_something(buf[i]);
+#+END_SRC
+
+Calls to read will return how many bytes were actually read. If it returns 0 then it means no bytes were are available.
+
+Each file descriptor device has a class written for it, and each one is a little bit different and offers more or less functions to communicate with the device. See the documentation for sepecifics on how to use a particular device type.
+
+In any case - the communication with the devices is asynchronous to the main thread unless a blocking call is specified. For example, i2c offers a blocking call read_byte because it may be necessary to get a byte from a i2c device's register before continuing initialization. It is not a good idea to use blocking calls in any of the update functions. It is always possible to come up with a way to do the same in a non blocking fashion.
+
+** Building
+
+Building the software currently still requires MRAA library because no gpio replacement for the mraa::gpio has yet been developed. This means that it is necessary to download the cross platform sdk offered by intel even when devloping on linux.
+
+For windows users, it is necessary to use the cross platform SDK no matter what - as you are truly cross-compiling. 
+
+The SDK can be found here: https://software.intel.com/en-us/iot/hardware/edison/downloads
+It is under "SDK - Cross Compile Tools".
+There are guides on the website to help with install - just follow these guides and use the default locations.
+
+CMake is required for both platforms and should be set in the path so that typing "cmake" and the command prompt will invoke the program. This happens by default in linux (for any program actually) and in windows the installer should offer this option.
+
+*** Linux
+After installing the SDK clone the project. To build, simply run the build.sh included in the source directory. To create a release build pass in -r to the script.
+
+Another option is to use Qt Creator to build. Since cmake is used, you can open the CMakeLists.txt file in Qt Creator and the project will be recognized. See below for Qt Creator Setup.
+
+*** Windows
+Right now the best option is to use Qt creator with cmake. See below for Qt Creator setup.
+
+** Deployment
+
+The easiest way to deploy and run the control module program on the edison is to scp the file to the edison. It is necessary to have wifi setup and know the edison's ip address to do this. To setup wifi and get the ip address it is necessary to connect to the edison over a serial port. The intel setup guides help with all of this.
+
+*** Set up serial terminal on linux
+https://software.intel.com/en-us/setting-up-serial-terminal-on-system-with-linux
+
+*** Set up serial terminal on windows
+https://software.intel.com/en-us/setting-up-serial-terminal-on-system-with-windows
+
+*** Connect to edison with wifi
+https://software.intel.com/en-us/connecting-your-intel-edison-board-using-wifi
+
+Once wifi is setup, copy the file to the edison using scp on Linux. Then ssh in to the edison and run it. For example if edison has user name "root" and ip address: 192.168.1.11:
+
+#+BEGIN_SRC python
+scp ./ctrlmodd root@192.168.1.11:~/ # must enter password
+ssh root@192.168.1.11 # again enter password
+#+END_SRC
+
+This offers no way to debug the executable other than with gdb remotely (have fun with that). A better way to do this is to set up Qt Creator to deploy and run the program for you.
+
+** Qt Creator Setup
+
+Qt Creator offers a great way to build, deploy, and debug the program running on the edison with minimal setup time. Luckily, there is no need to explain how to do all of that here because someone has already exlpained it fairly well for both windows and linux. 
+
+http://www.samontab.com/web/2015/02/cross-platform-development-for-intel-edison-using-cmake-and-qt-creator32-and-64-bits/
+
+Do not worry about the Edison.cmake, QtCreatorDeployment.txt, or CMakeLists.txt files portion of the guide as these have already been set up and should be downloaded when cloning the project. However, if devloping on windows the Edison.cmake file will need to be edited to reference the windows directories rather than the linux directories.
+
+** Known Issues
+
+- Need gaurd bands on all PID controlled values :: Instead of the altitude PID trying to correct throttle until the altitude is exactly in the middle of the room for example, it should try to correct it to being within some distance. The likely place to fix this would be in the file edpid_controller. A class member could be added to contain some threshold value that the input error value must be greater than in order for the PID to do anything. By default the value could be zero which would be the same as no threshold value. Another option for fixing the problem would be to filter the scaled values on the arduino board. Since all values from the edison are scaled values between -500 and 500, the arduino could simply ignore values between +/- 50 for example.
+
+- Electrical issues cause rplidar to send nonsense :: I'm not actually sure what causes this, but sometimes (usually when using Arduino as power supply) the rplidar will send sort of garbage scans. Resetting a few times usually fixes the problem and normal scans start to come in. Once normal scans have started I can only get the garbage scans to occur again if I physically disconnect and reconnect power to the system.
+
+- Other grounding issues :: When I was first connecting the system together I was having all sorts of strange issues where sometimes everything would work perfectly and other times 0xFF would be spammed on the TX of either the edison or the rplidar. If I observed this with the arduino (by connecting a wire to listen to edison or rplidar TX) the problem would go away. Eventually I found that there was a loose ground wire. I reconnected using different wires and I removed the intermediate connector that came with the rplidar and everything worked.
+
+- Incomplete Error Checking :: Though I tried to be as throrough as possible, some scenerios are not accounted for by error checking. If strange results are occuring, it may be neccessary to step through the code running on the edison using the qt creator debugger.
+
+- Uart 2 Console :: Currently it is impossible to make use of Uart 2 (the console switch when using Uart block) because the linux console program is attached to the port on edison startup. An edison was ruined when trying to disable this behavior - I changed a startup file to not enable the console and restarted the edison. This caused the edison startup procedure to fail and the edison restarts indefinitely - without any ability to SSH in to it or even re-flash linux. I did find a way to disable and re-enable the console without the need to change any startup files, but I am afraid to do it as I don't want to ruin another edison.
